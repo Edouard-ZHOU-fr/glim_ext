@@ -4,6 +4,9 @@
 #include <numeric>
 #include <Eigen/Core>
 
+#include <GeographicLib/MGRS.hpp>
+#include <GeographicLib/UTMUPS.hpp>
+
 #define GLIM_ROS2
 
 #include <boost/format.hpp>
@@ -14,6 +17,7 @@
 #ifdef GLIM_ROS2
 #include <glim/util/extension_module_ros2.hpp>
 #include <geometry_msgs/msg/pose_with_covariance_stamped.hpp>
+
 
 using ExtensionModuleBase = glim::ExtensionModuleROS2;
 using PoseWithCovarianceStamped = geometry_msgs::msg::PoseWithCovarianceStamped;
@@ -87,11 +91,16 @@ public:
   }
 
   void gnss_callback(const PoseWithCovarianceStampedConstPtr& gnss_msg) {
+    /////////////////////////////////////////////////////////////////////////
     Eigen::Vector4d gnss_data;
     const double stamp = to_sec(gnss_msg->header.stamp);
-    const auto& pos = gnss_msg->pose.pose.position;
-    gnss_data << stamp, pos.x, pos.y, pos.z;
+    // const auto& pos = gnss_msg->pose.pose.position;
+    double absolute_mgrs_x = gnss_msg->pose.pose.position.x;
+    double absolute_mgrs_y = gnss_msg->pose.pose.position.y;
+    double absolute_alt = gnss_msg->pose.pose.position.z; // 
+    gnss_data << to_sec(gnss_msg->header.stamp), absolute_mgrs_x, absolute_mgrs_y, absolute_alt;
     input_gnss_queue.push_back(gnss_data);
+    /////////////////////////////////////////////////////////////////////////
   }
 
   void on_insert_submap(const SubMap::ConstPtr& submap) { input_submap_queue.push_back(submap); }
@@ -108,6 +117,8 @@ public:
     logger->info("starting GNSS global thread");
     std::deque<Eigen::Vector4d> utm_queue;
     std::deque<SubMap::ConstPtr> submap_queue;
+
+/////////////////synchoniser le time stamps///////////////////:
 
     while (!kill_switch) {
       // Convert GeoPoint(lat/lon) to UTM
@@ -152,6 +163,7 @@ public:
         submap_queue.pop_front();
         utm_queue.erase(utm_queue.begin(), left);
       }
+//////////////////////synchoniser le time stamps///////////////////:
 
       // Initialize T_world_utm
       if (!transformation_initialized && !submaps.empty() && (submaps.front()->T_world_origin.inverse() * submaps.back()->T_world_origin).translation().norm() > min_baseline) {
@@ -167,7 +179,7 @@ public:
         Eigen::Matrix3d cov = Eigen::Matrix3d::Zero();
         for (int i = 0; i < submaps.size(); i++) {
           const Eigen::Vector3d centered_est = submaps[i]->T_world_origin.translation() - mean_est;
-          const Eigen::Vector3d centered_gnss = submap_coords[i].tail<3>() - mean_gnss;
+          const Eigen::Vector3d centered_gnss = submap_coords[i].tail<3>() - mean_gnss;  // 累加所有插值后的 GNSS 点
           cov += centered_gnss * centered_est.transpose();
         }
         cov /= submaps.size();
@@ -194,18 +206,23 @@ public:
           logger->debug("submap={} gnss={}", convert_to_string(submaps[i]->T_world_origin.translation().eval()), convert_to_string(gnss));
         }
 
-        logger->info("T_world_utm={}", convert_to_string(T_world_utm));
+        // logger->info("T_world_mgrs={}", convert_to_string(T_world_utm));
+        logger->info("T_mgrs_world={}", convert_to_string(T_utm_world));
+
         transformation_initialized = true;
       }
 
       // Add translation prior factor
       if (transformation_initialized) {
         const Eigen::Vector3d xyz = T_world_utm * submap_coords.back().tail<3>();
+        // const Eigen::Vector3d xyz = submap_coords.back().tail<3>();
+
         logger->debug("submap={} gnss={}", convert_to_string(submaps.back()->T_world_origin.translation().eval()), convert_to_string(xyz));
 
         const auto& submap = submaps.back();
         // note: should use a more accurate information matrix
         const auto model = gtsam::noiseModel::Isotropic::Information(prior_inf_scale.asDiagonal());
+        //ajouter une contrainte GNSS (rouge dans la viewer)
         gtsam::NonlinearFactor::shared_ptr factor(new gtsam::PoseTranslationPrior<gtsam::Pose3>(X(submap->id), xyz, model));
         output_factors.push_back(factor);
       }
