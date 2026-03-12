@@ -102,6 +102,21 @@ public:
     input_gnss_queue.push_back(gnss_data);
     /////////////////////////////////////////////////////////////////////////
   }
+  void mgrsLogToFile(const std::string& filename, const std::string& mgrs) {
+    // std::ios::app (Append)
+    std::ofstream outFile(filename, std::ios::out);
+
+    if (outFile.is_open()) {
+        outFile << std::fixed << std::setprecision(6);
+        
+        outFile << mgrs<< std::endl;
+        
+        outFile.close(); 
+    } else {
+        std::cerr << "Error: Could not open file " << filename << std::endl;
+    }
+  }
+    /////////////////////////////////////////////////////////////////////////
 
   void on_insert_submap(const SubMap::ConstPtr& submap) { input_submap_queue.push_back(submap); }
 
@@ -208,6 +223,7 @@ public:
 
         // logger->info("T_world_mgrs={}", convert_to_string(T_world_utm));
         logger->info("T_mgrs_world={}", convert_to_string(T_utm_world));
+        mgrsLogToFile("Mgrs.txt",convert_to_string(T_utm_world));
 
         transformation_initialized = true;
       }
