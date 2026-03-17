@@ -65,9 +65,9 @@ public:
 
     glim::Config config(config_path);
     gnss_topic = config.param<std::string>("gnss", "gnss_topic", "/pose_with_cov");
-    prior_inf_scale = config.param<Eigen::Vector3d>("gnss", "prior_inf_scale", Eigen::Vector3d(1e3, 1e3, 0.0));
+    prior_inf_scale = config.param<Eigen::Vector3d>("gnss", "prior_inf_scale", Eigen::Vector3d(1e3, 1e3, 3e3));
     min_baseline = config.param<double>("gnss", "min_baseline", 5.0);
-
+    dynamic_scale =  config.param<bool>("gnss", "dynamic_scale", false);
     transformation_initialized = false;
     T_world_utm.setIdentity();
 
@@ -98,6 +98,20 @@ public:
     double absolute_mgrs_x = gnss_msg->pose.pose.position.x;
     double absolute_mgrs_y = gnss_msg->pose.pose.position.y;
     double absolute_alt = gnss_msg->pose.pose.position.z; // 
+//  recuperer la covariance de Kinematic_state
+    if (dynamic_scale) {
+      const double gnss_inscale_xy = 1.3;
+      const double gnss_inscale_z = 3.2;
+      double cov_x = gnss_msg->pose.covariance[0];
+      double cov_y = gnss_msg->pose.covariance[7];
+      double cov_z = gnss_msg->pose.covariance[14];
+      double info_x = (1.0 / std::max(cov_x, 1e-6))*gnss_inscale_xy; // eviter par 0
+      double info_y = (1.0 / std::max(cov_y, 1e-6))*gnss_inscale_xy;
+      double info_z = (1.0 / std::max(cov_z, 1e-6))*gnss_inscale_z;
+      // std::cout << "info_x:" << info_x << "; info_z:" << info_z << std::endl;
+      this->current_inf_scale << info_x, info_y, info_z;
+
+    }
     gnss_data << to_sec(gnss_msg->header.stamp), absolute_mgrs_x, absolute_mgrs_y, absolute_alt;
     input_gnss_queue.push_back(gnss_data);
     /////////////////////////////////////////////////////////////////////////
@@ -133,7 +147,7 @@ public:
     std::deque<Eigen::Vector4d> utm_queue;
     std::deque<SubMap::ConstPtr> submap_queue;
 
-/////////////////synchoniser le time stamps///////////////////:
+/////////////////synchoniser le time stamps -->///////////////////:
 
     while (!kill_switch) {
       // Convert GeoPoint(lat/lon) to UTM
@@ -178,7 +192,7 @@ public:
         submap_queue.pop_front();
         utm_queue.erase(utm_queue.begin(), left);
       }
-//////////////////////synchoniser le time stamps///////////////////:
+//////////////////////synchoniser le time stamps <-- ///////////////////:
 
       // Initialize T_world_utm
       if (!transformation_initialized && !submaps.empty() && (submaps.front()->T_world_origin.inverse() * submaps.back()->T_world_origin).translation().norm() > min_baseline) {
@@ -237,10 +251,30 @@ public:
 
         const auto& submap = submaps.back();
         // note: should use a more accurate information matrix
-        const auto model = gtsam::noiseModel::Isotropic::Information(prior_inf_scale.asDiagonal());
-        //ajouter une contrainte GNSS (rouge dans la viewer)
-        gtsam::NonlinearFactor::shared_ptr factor(new gtsam::PoseTranslationPrior<gtsam::Pose3>(X(submap->id), xyz, model));
-        output_factors.push_back(factor);
+        if (dynamic_scale) {
+          logger->info("curent_scale={}", convert_to_string(current_inf_scale));
+          if (current_inf_scale.minCoeff() <= 1e3|| current_inf_scale.z() <= 2e3) {
+            if (current_inf_scale.minCoeff() <= 1e-2) {
+              logger->error("Gnss abodonne");
+              continue;
+            }
+            else {
+              logger->warn("Gnss faible");
+              current_inf_scale = Eigen::Vector3d(1e3, 1e3, 3e3);
+            }
+          }
+          const auto model = gtsam::noiseModel::Isotropic::Information(current_inf_scale.asDiagonal());
+          gtsam::NonlinearFactor::shared_ptr factor(new gtsam::PoseTranslationPrior<gtsam::Pose3>(X(submap->id), xyz, model));
+          output_factors.push_back(factor);
+        }
+        else {
+          const auto model = gtsam::noiseModel::Isotropic::Information(prior_inf_scale.asDiagonal());
+          gtsam::NonlinearFactor::shared_ptr factor(new gtsam::PoseTranslationPrior<gtsam::Pose3>(X(submap->id), xyz, model));
+          output_factors.push_back(factor);
+        }
+        // //ajouter une contrainte GNSS (rouge dans la viewer)
+        // gtsam::NonlinearFactor::shared_ptr factor(new gtsam::PoseTranslationPrior<gtsam::Pose3>(X(submap->id), xyz, model));
+        // output_factors.push_back(factor);
       }
     }
   }
@@ -258,7 +292,11 @@ private:
 
   std::string gnss_topic;
   Eigen::Vector3d prior_inf_scale;
+  Eigen::Vector3d current_inf_scale;
+  bool dynamic_scale;
   double min_baseline;
+
+
 
   bool transformation_initialized;
   Eigen::Isometry3d T_world_utm;

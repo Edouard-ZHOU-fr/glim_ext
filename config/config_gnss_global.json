@@ -2,6 +2,7 @@
   "gnss": {
     "gnss_topic": "/localization/pose_with_covariance_stamped",
     "min_baseline": 3.0,
+    "dynamic_scale":true,
     "prior_inf_scale": [
       2e4,
       2e4,
