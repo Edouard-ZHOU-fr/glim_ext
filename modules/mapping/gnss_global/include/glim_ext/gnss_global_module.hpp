@@ -2,6 +2,8 @@
 #include <atomic>
 #include <thread>
 #include <numeric>
+#include <cmath>
+#include <limits>
 #include <Eigen/Core>
 
 #include <GeographicLib/MGRS.hpp>
@@ -38,6 +40,7 @@ using ExtensionModuleBase = glim::ExtensionModuleROS;
 #include <gtsam/inference/Symbol.h>
 #include <gtsam/geometry/Pose3.h>
 #include <gtsam/slam/PoseTranslationPrior.h>
+#include <gtsam/nonlinear/PriorFactor.h>
 #include <gtsam/nonlinear/NonlinearFactor.h>
 #include <gtsam/nonlinear/NonlinearFactorGraph.h>
 
@@ -58,6 +61,9 @@ class GNSSGlobal : public ExtensionModuleBase {
 public:
   EIGEN_MAKE_ALIGNED_OPERATOR_NEW
 
+  // [stamp, x, y, z, yaw, yaw_var] in the MGRS frame (yaw: heading of base_link [rad], yaw_var: its variance [rad^2])
+  using GnssData = Eigen::Matrix<double, 6, 1>;
+
   GNSSGlobal() : logger(create_module_logger("gnss_global")) {
     logger->info("initializing GNSS global constraints");
     const std::string config_path = glim::GlobalConfigExt::get_config_path("config_gnss_global");
@@ -68,6 +74,11 @@ public:
     prior_inf_scale = config.param<Eigen::Vector3d>("gnss", "prior_inf_scale", Eigen::Vector3d(1e3, 1e3, 3e3));
     min_baseline = config.param<double>("gnss", "min_baseline", 5.0);
     dynamic_scale =  config.param<bool>("gnss", "dynamic_scale", false);
+    enable_yaw_prior = config.param<bool>("gnss", "enable_yaw_prior", false);
+    yaw_prior_sigma = config.param<double>("gnss", "yaw_prior_sigma_deg", 1.0) * M_PI / 180.0;
+    yaw_min_sigma = config.param<double>("gnss", "yaw_min_sigma_deg", 0.5) * M_PI / 180.0;
+    yaw_max_sigma = config.param<double>("gnss", "yaw_max_sigma_deg", 5.0) * M_PI / 180.0;
+    last_yaw_prior_submap_id = -1;
     transformation_initialized = false;
     T_world_utm.setIdentity();
 
@@ -92,7 +103,7 @@ public:
 
   void gnss_callback(const PoseWithCovarianceStampedConstPtr& gnss_msg) {
     /////////////////////////////////////////////////////////////////////////
-    Eigen::Vector4d gnss_data;
+    GnssData gnss_data;
     const double stamp = to_sec(gnss_msg->header.stamp);
     // const auto& pos = gnss_msg->pose.pose.position;
     double absolute_mgrs_x = gnss_msg->pose.pose.position.x;
@@ -112,7 +123,20 @@ public:
       this->current_inf_scale << info_x, info_y, info_z;
 
     }
-    gnss_data << to_sec(gnss_msg->header.stamp), absolute_mgrs_x, absolute_mgrs_y, absolute_alt;
+    // Heading of base_link in the MGRS frame and its variance (covariance order: x, y, z, roll, pitch, yaw)
+    const auto& o = gnss_msg->pose.pose.orientation;
+    Eigen::Quaterniond q(o.w, o.x, o.y, o.z);
+    double yaw = 0.0;
+    double yaw_var = gnss_msg->pose.covariance[35];
+    if (!std::isfinite(q.norm()) || q.norm() < 1e-6) {
+      // Invalid orientation (e.g., all zero before the EKF initialization): the heading is unavailable, the position is still used
+      yaw_var = std::numeric_limits<double>::infinity();
+    } else {
+      q.normalize();
+      yaw = std::atan2(2.0 * (q.w() * q.z() + q.x() * q.y()), 1.0 - 2.0 * (q.y() * q.y() + q.z() * q.z()));
+    }
+
+    gnss_data << to_sec(gnss_msg->header.stamp), absolute_mgrs_x, absolute_mgrs_y, absolute_alt, yaw, yaw_var;
     input_gnss_queue.push_back(gnss_data);
     /////////////////////////////////////////////////////////////////////////
   }
@@ -144,7 +168,7 @@ public:
 
   void backend_task() {
     logger->info("starting GNSS global thread");
-    std::deque<Eigen::Vector4d> utm_queue;
+    std::deque<GnssData> utm_queue;
     std::deque<SubMap::ConstPtr> submap_queue;
 
 /////////////////synchoniser le time stamps -->///////////////////:
@@ -173,7 +197,7 @@ public:
         const auto& submap = submap_queue.front();
         const double stamp = submap->frames[submap->frames.size() / 2]->stamp;
 
-        const auto right = std::lower_bound(utm_queue.begin(), utm_queue.end(), stamp, [](const Eigen::Vector4d& utm, const double t) { return utm[0] < t; });
+        const auto right = std::lower_bound(utm_queue.begin(), utm_queue.end(), stamp, [](const GnssData& utm, const double t) { return utm[0] < t; });
         if (right == utm_queue.end() || (right + 1) == utm_queue.end()) {
           logger->warn("invalid condition in GNSS global module!!");
           break;
@@ -184,7 +208,14 @@ public:
         const double tl = (*left)[0];
         const double tr = (*right)[0];
         const double p = (stamp - tl) / (tr - tl);
-        const Eigen::Vector4d interpolated = (1.0 - p) * (*left) + p * (*right);
+        GnssData interpolated = (1.0 - p) * (*left) + p * (*right);
+        // Interpolate the heading along the shortest arc (e.g., -179 deg -> 179 deg)
+        const double dyaw = std::remainder((*right)[4] - (*left)[4], 2.0 * M_PI);
+        interpolated[4] = std::remainder((*left)[4] + p * dyaw, 2.0 * M_PI);
+        // The heading is unavailable if it is unavailable at either end (and 0 * inf would give NaN, i.e., "no covariance")
+        if (std::isinf((*left)[5]) || std::isinf((*right)[5])) {
+          interpolated[5] = std::numeric_limits<double>::infinity();
+        }
 
         submaps.push_back(submap);
         submap_coords.push_back(interpolated);
@@ -200,7 +231,7 @@ public:
         Eigen::Vector3d mean_gnss = Eigen::Vector3d::Zero();
         for (int i = 0; i < submaps.size(); i++) {
           mean_est += submaps[i]->T_world_origin.translation();
-          mean_gnss += submap_coords[i].tail<3>();
+          mean_gnss += submap_coords[i].segment<3>(1);
         }
         mean_est /= submaps.size();
         mean_gnss /= submaps.size();
@@ -208,7 +239,7 @@ public:
         Eigen::Matrix3d cov = Eigen::Matrix3d::Zero();
         for (int i = 0; i < submaps.size(); i++) {
           const Eigen::Vector3d centered_est = submaps[i]->T_world_origin.translation() - mean_est;
-          const Eigen::Vector3d centered_gnss = submap_coords[i].tail<3>() - mean_gnss;  // 累加所有插值后的 GNSS 点
+          const Eigen::Vector3d centered_gnss = submap_coords[i].segment<3>(1) - mean_gnss;  // 累加所有插值后的 GNSS 点
           cov += centered_gnss * centered_est.transpose();
         }
         cov /= submaps.size();
@@ -226,12 +257,31 @@ public:
 
         Eigen::Isometry3d T_utm_world = Eigen::Isometry3d::Identity();
         T_utm_world.linear().block<2, 2>(0, 0) = U * S * V.transpose();
+
+        // The SVD yaw relies on the positions over a short baseline (min_baseline) and is sensitive to the GNSS position noise.
+        // When GNSS headings are available, use the circular mean of (GNSS heading - estimated heading) instead, which does not
+        // depend on the baseline. This also makes the yaw priors consistent with the (locked) first submap from the beginning
+        const double svd_yaw = std::atan2(T_utm_world.linear()(1, 0), T_utm_world.linear()(0, 0));
+        double heading_yaw = 0.0;
+        double heading_spread = 0.0;
+        if (enable_yaw_prior && estimate_yaw_offset_from_heading(heading_yaw, heading_spread)) {
+          T_utm_world.linear() = Eigen::AngleAxisd(heading_yaw, Eigen::Vector3d::UnitZ()).toRotationMatrix();
+          logger->info(
+            "T_mgrs_world yaw from GNSS heading={:.3f} deg (spread={:.3f} deg), from positions (SVD)={:.3f} deg",
+            heading_yaw * 180.0 / M_PI,
+            heading_spread * 180.0 / M_PI,
+            svd_yaw * 180.0 / M_PI);
+        } else {
+          logger->info("T_mgrs_world yaw from positions (SVD)={:.3f} deg", svd_yaw * 180.0 / M_PI);
+        }
+
+        // Given the rotation, the least-squares translation aligns the centroids
         T_utm_world.translation() = mean_gnss - T_utm_world.linear() * mean_est;
 
         T_world_utm = T_utm_world.inverse();
 
         for (int i = 0; i < submaps.size(); i++) {
-          const Eigen::Vector3d gnss = T_world_utm * submap_coords[i].tail<3>();
+          const Eigen::Vector3d gnss = T_world_utm * submap_coords[i].segment<3>(1);
           logger->debug("submap={} gnss={}", convert_to_string(submaps[i]->T_world_origin.translation().eval()), convert_to_string(gnss));
         }
 
@@ -244,8 +294,8 @@ public:
 
       // Add translation prior factor
       if (transformation_initialized) {
-        const Eigen::Vector3d xyz = T_world_utm * submap_coords.back().tail<3>();
-        // const Eigen::Vector3d xyz = submap_coords.back().tail<3>();
+        const Eigen::Vector3d xyz = T_world_utm * submap_coords.back().segment<3>(1);
+        // const Eigen::Vector3d xyz = submap_coords.back().segment<3>(1);
 
         logger->debug("submap={} gnss={}", convert_to_string(submaps.back()->T_world_origin.translation().eval()), convert_to_string(xyz));
 
@@ -275,26 +325,132 @@ public:
         // //ajouter une contrainte GNSS (rouge dans la viewer)
         // gtsam::NonlinearFactor::shared_ptr factor(new gtsam::PoseTranslationPrior<gtsam::Pose3>(X(submap->id), xyz, model));
         // output_factors.push_back(factor);
+
+        // Add yaw prior factor (once per submap)
+        if (enable_yaw_prior && submap->id != last_yaw_prior_submap_id) {
+          add_yaw_prior(submap, submap_coords.back());
+          last_yaw_prior_submap_id = submap->id;
+        }
       }
     }
   }
 
 private:
+  /**
+   * @brief Estimate the yaw of T_utm_world as the circular mean of (GNSS heading - estimated heading) over the associated submaps.
+   * @param yaw     [out] yaw of T_utm_world [rad]
+   * @param spread  [out] circular standard deviation of the differences [rad] (consistency check)
+   * @return        false if no submap has a usable GNSS heading
+   */
+  bool estimate_yaw_offset_from_heading(double& yaw, double& spread) const {
+    double sum_sin = 0.0;
+    double sum_cos = 0.0;
+    int num_used = 0;
+    for (int i = 0; i < submaps.size(); i++) {
+      const GnssData& gnss = submap_coords[i];
+      // Same validity criterion as the yaw priors
+      if (std::isinf(gnss[5])) {
+        continue;  // heading unavailable
+      }
+      if (dynamic_scale && std::isfinite(gnss[5]) && gnss[5] > 0.0 && std::sqrt(gnss[5]) > yaw_max_sigma) {
+        continue;
+      }
+
+      // The odometry pose of the origin frame is used (submap->T_world_origin is concurrently updated by the global mapping)
+      const Eigen::Matrix3d R_world_est = submaps[i]->origin_frame()->T_world_imu.linear();
+      const double yaw_est = std::atan2(R_world_est(1, 0), R_world_est(0, 0));
+      const double diff = gnss[4] - yaw_est;
+      sum_sin += std::sin(diff);
+      sum_cos += std::cos(diff);
+      num_used++;
+    }
+
+    if (num_used == 0) {
+      return false;
+    }
+
+    yaw = std::atan2(sum_sin, sum_cos);
+    // Circular standard deviation: sqrt(-2 ln R), R = mean resultant length
+    const double R = std::min(1.0, std::hypot(sum_sin, sum_cos) / num_used);
+    spread = std::sqrt(-2.0 * std::log(std::max(R, 1e-12)));
+    return true;
+  }
+
+  /**
+   * @brief Constrain the heading of a submap with the GNSS heading.
+   * @note  A PriorFactor<Pose3> (serializable) is used as a yaw-only prior: its measured rotation is the current estimate rotated
+   *        to the GNSS heading, and only the z component of its error is weighted. Roll/pitch and translation get a negligible
+   *        weight. This component is the heading difference around the world z axis (up to the small vehicle roll/pitch).
+   *        The submap origin is assumed to be the base_link frame (IMU frame = base_link).
+   */
+  void add_yaw_prior(const SubMap::ConstPtr& submap, const GnssData& gnss) {
+    // yaw_var = +inf: heading unavailable (invalid orientation), NaN or <= 0: no covariance given (fallback to yaw_prior_sigma)
+    if (std::isinf(gnss[5])) {
+      logger->debug("skip yaw prior for submap {} (heading unavailable)", submap->id);
+      return;
+    }
+
+    double sigma = yaw_prior_sigma;
+    if (dynamic_scale) {
+      const double yaw_var = gnss[5];
+      if (!std::isfinite(yaw_var) || yaw_var <= 0.0) {
+        sigma = yaw_prior_sigma;
+      } else {
+        // Floor the sigma: the covariance of the EKF output is overconfident
+        sigma = std::max(std::sqrt(yaw_var), yaw_min_sigma);
+      }
+    }
+
+    if (sigma > yaw_max_sigma) {
+      logger->debug("skip yaw prior for submap {} (sigma={:.2f} deg)", submap->id, sigma * 180.0 / M_PI);
+      return;
+    }
+
+    // T_world_utm is a rotation around the z axis only: yaw_world = yaw_mgrs - yaw(T_utm_world)
+    const Eigen::Matrix3d R_world_utm = T_world_utm.linear();
+    const double yaw_world_utm = std::atan2(R_world_utm(1, 0), R_world_utm(0, 0));
+    const double yaw_world = std::remainder(gnss[4] + yaw_world_utm, 2.0 * M_PI);
+
+    // Measured rotation = estimated rotation turned around the world z axis to the GNSS heading. Keeping the estimated roll/pitch
+    // in the prior avoids a heading bias of about roll*pitch/2 on slopes that Rz(yaw) alone would introduce.
+    // The estimate only provides roll/pitch (its yaw cancels out). The odometry pose of the origin frame is used instead of
+    // submap->T_world_origin, which is concurrently updated by the global mapping thread. Both world frames are gravity-aligned.
+    // Only the rotation part matters. The translation of the estimate keeps the (negligible) translation error small
+    const Eigen::Isometry3d& T_world_est = submap->origin_frame()->T_world_imu;
+    const Eigen::Matrix3d R_world_est = T_world_est.linear();
+    const double yaw_est = std::atan2(R_world_est(1, 0), R_world_est(0, 0));
+    const gtsam::Rot3 R_prior = gtsam::Rot3::Rz(std::remainder(yaw_world - yaw_est, 2.0 * M_PI)) * gtsam::Rot3(R_world_est);
+    const gtsam::Pose3 prior(R_prior, gtsam::Point3(T_world_est.translation()));
+
+    constexpr double loose = 1e3;
+    const gtsam::Vector6 sigmas = (gtsam::Vector6() << loose, loose, sigma, loose, loose, loose).finished();
+    const auto model = gtsam::noiseModel::Diagonal::Sigmas(sigmas);
+    output_factors.push_back(gtsam::make_shared<gtsam::PriorFactor<gtsam::Pose3>>(X(submap->id), prior, model));
+
+    logger->debug("yaw prior submap={} yaw_gnss={:.2f} yaw_est={:.2f} sigma={:.2f} [deg]", submap->id, yaw_world * 180.0 / M_PI, yaw_est * 180.0 / M_PI, sigma * 180.0 / M_PI);
+  }
+
   std::atomic_bool kill_switch;
   std::thread thread;
 
-  ConcurrentVector<Eigen::Vector4d> input_gnss_queue;
+  ConcurrentVector<GnssData> input_gnss_queue;
   ConcurrentVector<SubMap::ConstPtr> input_submap_queue;
   ConcurrentVector<gtsam::NonlinearFactor::shared_ptr> output_factors;
 
   std::vector<SubMap::ConstPtr> submaps;
-  std::vector<Eigen::Vector4d> submap_coords;
+  std::vector<GnssData> submap_coords;
 
   std::string gnss_topic;
   Eigen::Vector3d prior_inf_scale;
   Eigen::Vector3d current_inf_scale;
   bool dynamic_scale;
   double min_baseline;
+
+  bool enable_yaw_prior;
+  double yaw_prior_sigma;  // [rad] sigma of the yaw prior (used when dynamic_scale is false)
+  double yaw_min_sigma;    // [rad] lower bound of the sigma derived from the GNSS covariance
+  double yaw_max_sigma;    // [rad] yaw priors with a larger sigma are not created
+  int last_yaw_prior_submap_id;
 
 
 

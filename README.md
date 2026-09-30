@@ -70,6 +70,51 @@ Example (`libflat_earther.so`):
 ### GNSS constraints (libgnss_global.so, ROS2 only)
 - GNSS-based constraints for global optimization
 
+#### Milla version
+
+Input: `geometry_msgs/PoseWithCovarianceStamped` in the MGRS frame (`map`), i.e., the Autoware EKF output `/localization/kinematic_state` republished by the `convert_gnss` node. The pose is the `base_link` pose, and the submap origin (IMU frame) is assumed to coincide with `base_link`.
+
+How it works:
+1. GNSS messages are interpolated at the timestamp of the origin (middle) frame of each submap. The heading is interpolated along the shortest arc.
+2. Once the trajectory is longer than `min_baseline`, `T_mgrs_world` (GLIM world frame -> MGRS) is estimated and written to `Mgrs.txt` in the working directory. It is a rotation around the z axis plus a translation:
+   - yaw: circular mean of (GNSS heading - estimated heading) over the associated submaps if `enable_yaw_prior` is true, otherwise a 2D SVD alignment of the positions (sensitive to the GNSS position noise over the short baseline)
+   - translation: alignment of the centroids of the estimated and GNSS positions
+3. For each new submap, a translation prior (`PoseTranslationPrior`) and, if enabled, a yaw prior are added to the global factor graph.
+
+The yaw prior is a `PriorFactor<Pose3>` whose measured rotation is the estimated rotation turned around the world z axis to the GNSS heading. Only the yaw component of its error is weighted (roll/pitch/translation sigmas = 1e3): it constrains the heading around the world z axis without affecting the roll/pitch given by the IMU. `PriorFactor<Pose3>` is serializable, so the yaw priors are kept in dumped maps.
+
+Parameters (`config/config_gnss_global.json`):
+
+| Parameter | Default (code) | Milla config | Description |
+|---|---|---|---|
+| `gnss_topic` | `/pose_with_cov` | `/localization/pose_with_covariance_stamped` | Input GNSS pose topic |
+| `min_baseline` | `5.0` | `3.0` | Trajectory length [m] required before estimating `T_mgrs_world` |
+| `dynamic_scale` | `false` | `true` | Weight the priors with the covariance of the GNSS messages (see below) instead of fixed values |
+| `prior_inf_scale` | `[1e3, 1e3, 3e3]` | `[2e4, 2e4, 4e5]` | Information (1/sigma^2) of the translation prior in x, y, z when `dynamic_scale` is false |
+| `enable_yaw_prior` | `false` | `true` | Add yaw priors, and estimate the yaw of `T_mgrs_world` from the GNSS headings |
+| `yaw_prior_sigma_deg` | `1.0` | `1.0` | Sigma [deg] of the yaw prior when `dynamic_scale` is false, or when the message has no valid yaw covariance |
+| `yaw_min_sigma_deg` | `0.5` | `0.5` | Lower bound [deg] of the sigma derived from the message yaw covariance (`dynamic_scale` = true) |
+| `yaw_max_sigma_deg` | `5.0` | `5.0` | GNSS headings with a larger sigma [deg] are ignored (no yaw prior, not used for the `T_mgrs_world` yaw) |
+
+`dynamic_scale` = true:
+- Translation prior: information = `1.3 / cov_xx`, `1.3 / cov_yy`, `3.2 / cov_zz` (covariances floored to 1e-6), from the **latest** GNSS message. If the smallest information is <= 1e3 or the z information is <= 2e3, the GNSS is considered weak and the information is set to `[1e3, 1e3, 3e3]` ("Gnss faible"), or the prior is skipped if the smallest information is <= 1e-2 ("Gnss abodonne").
+- Yaw prior: sigma = max(sqrt(yaw variance `covariance[35]`), `yaw_min_sigma_deg`), interpolated at the submap timestamp. Priors with sigma > `yaw_max_sigma_deg` are not created.
+
+Tuning the yaw prior:
+- `yaw_min_sigma_deg` is the main parameter. The Autoware EKF covariance is overconfident (yaw sigma ~0.4 deg, position sigma ~7 mm) and its heading is not independent of the IMU used by GLIM. Increase it to 1-2 deg if the map gets distorted or inconsistent with the point cloud matching. Decrease it only with a reliable heading (e.g., dual-antenna RTK).
+- `yaw_max_sigma_deg`: decrease it to 2-3 deg to only accept good headings (fewer priors in degraded GNSS areas: bridges, tunnels, urban canyons). Increasing it is not recommended.
+- `yaw_prior_sigma_deg` is only used without `dynamic_scale` (or without a valid yaw covariance).
+- Do not use `/gnss_front/odometry` as the heading source: its heading is derived from the motion and is unusable at low speed.
+
+Logs:
+- At initialization: `T_mgrs_world yaw from GNSS heading=... deg (spread=... deg), from positions (SVD)=... deg`. The spread (circular standard deviation of the heading differences) should be a few tenths of a degree. A spread of several degrees indicates unstable GNSS headings or an odometry heading drift at the beginning.
+- With the debug log level, each yaw prior: `yaw prior submap=... yaw_gnss=... yaw_est=... sigma=... [deg]`.
+
+Known limitations:
+- Priors are only added to the last associated submap of each processing loop: when several submaps are associated at once, the others get no prior. Translation priors may also be added several times to the same submap (yaw priors are added once per submap).
+- The translation weights of `dynamic_scale` use the covariance of the latest GNSS message, not the one at the submap timestamp.
+- When merging dumped maps (`GlobalMapping::load()` with an existing map), all `PoseTranslationPrior` and `PriorFactor<Pose3>` factors, including the yaw priors, are removed.
+
 ### ScanContext Loop Detector (libscancontext_loop_detector.so)
 - Explicit loop detection based on ScanContext
 - Dependency: [ScanContext](https://github.com/irapkaist/scancontext) (CC BY-NC-SA 4.0)
