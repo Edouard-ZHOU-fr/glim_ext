@@ -6,6 +6,7 @@ set(CMAKE_CXX_STANDARD 17)
 find_package(glim REQUIRED)
 find_package(GTSAM REQUIRED)
 find_package(spdlog REQUIRED)
+find_package(Iridescence REQUIRED)
 
 if($ENV{ROS_VERSION} EQUAL 2)
   # ROS2
@@ -39,5 +40,6 @@ target_link_libraries(gnss_global
   ${GTSAM_LIBRARIES}
   ${glim_LIBRARIES}
   spdlog::spdlog
+  Iridescence::Iridescence
   ${catkin_LIBRARIES}
 )

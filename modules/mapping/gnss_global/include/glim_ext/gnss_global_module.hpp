@@ -1,5 +1,7 @@
+#include <map>
 #include <deque>
 #include <atomic>
+#include <memory>
 #include <thread>
 #include <numeric>
 #include <cmath>
@@ -48,6 +50,9 @@ using ExtensionModuleBase = glim::ExtensionModuleROS;
 #include <glim/util/convert_to_string.hpp>
 #include <glim_ext/util/config_ext.hpp>
 
+#include <glk/thin_lines.hpp>
+#include <guik/viewer/light_viewer.hpp>
+
 namespace glim {
 
 using gtsam::symbol_shorthand::X;
@@ -82,6 +87,9 @@ public:
     transformation_initialized = false;
     T_world_utm.setIdentity();
 
+    visualize_constraints = config.param<bool>("gnss", "isShow", true);
+    vis_state = std::make_shared<GnssVisState>();
+
     kill_switch = false;
     thread = std::thread([this] { backend_task(); });
 
@@ -90,6 +98,9 @@ public:
     using std::placeholders::_3;
     GlobalMappingCallbacks::on_insert_submap.add(std::bind(&GNSSGlobal::on_insert_submap, this, _1));
     GlobalMappingCallbacks::on_smoother_update.add(std::bind(&GNSSGlobal::on_smoother_update, this, _1, _2, _3));
+    if (visualize_constraints) {
+      GlobalMappingCallbacks::on_update_submaps.add(std::bind(&GNSSGlobal::on_update_submaps, this, _1));
+    }
   }
   ~GNSSGlobal() {
     kill_switch = true;
@@ -164,6 +175,27 @@ public:
       logger->debug("insert {} GNSS prior factors", factors.size());
       new_factors.add(factors);
     }
+  }
+
+  void on_update_submaps(const std::vector<SubMap::Ptr>& submaps) {
+    if (!guik::running()) {
+      return;
+    }
+
+    // Latest (optimized) submap positions indexed by submap id
+    std::vector<Eigen::Vector3f> positions;
+    for (const auto& submap : submaps) {
+      if (submap->id >= positions.size()) {
+        positions.resize(submap->id + 1, Eigen::Vector3f::Constant(std::numeric_limits<float>::quiet_NaN()));
+      }
+      positions[submap->id] = submap->T_world_origin.translation().cast<float>();
+    }
+
+    const auto state = vis_state;
+    guik::viewer()->invoke([state, positions] {
+      state->submap_positions = positions;
+      update_viewer(*state);
+    });
   }
 
   void backend_task() {
@@ -300,17 +332,20 @@ public:
         logger->debug("submap={} gnss={}", convert_to_string(submaps.back()->T_world_origin.translation().eval()), convert_to_string(xyz));
 
         const auto& submap = submaps.back();
+        GnssVisStatus vis_status = GnssVisStatus::NORMAL;
         // note: should use a more accurate information matrix
         if (dynamic_scale) {
           logger->info("curent_scale={}", convert_to_string(current_inf_scale));
           if (current_inf_scale.minCoeff() <= 1e3|| current_inf_scale.z() <= 2e3) {
             if (current_inf_scale.minCoeff() <= 1e-2) {
               logger->error("Gnss abodonne");
+              visualize_position_prior(submap->id, xyz, GnssVisStatus::ABANDONED);
               continue;
             }
             else {
               logger->warn("Gnss faible");
               current_inf_scale = Eigen::Vector3d(1e3, 1e3, 3e3);
+              vis_status = GnssVisStatus::WEAK;
             }
           }
           const auto model = gtsam::noiseModel::Isotropic::Information(current_inf_scale.asDiagonal());
@@ -322,9 +357,8 @@ public:
           gtsam::NonlinearFactor::shared_ptr factor(new gtsam::PoseTranslationPrior<gtsam::Pose3>(X(submap->id), xyz, model));
           output_factors.push_back(factor);
         }
-        // //ajouter une contrainte GNSS (rouge dans la viewer)
-        // gtsam::NonlinearFactor::shared_ptr factor(new gtsam::PoseTranslationPrior<gtsam::Pose3>(X(submap->id), xyz, model));
-        // output_factors.push_back(factor);
+        // Show the GNSS position prior in the viewer (the viewer does not draw unary factors)
+        visualize_position_prior(submap->id, xyz, vis_status);
 
         // Add yaw prior factor (once per submap)
         if (enable_yaw_prior && submap->id != last_yaw_prior_submap_id) {
@@ -426,8 +460,129 @@ private:
     const gtsam::Vector6 sigmas = (gtsam::Vector6() << loose, loose, sigma, loose, loose, loose).finished();
     const auto model = gtsam::noiseModel::Diagonal::Sigmas(sigmas);
     output_factors.push_back(gtsam::make_shared<gtsam::PriorFactor<gtsam::Pose3>>(X(submap->id), prior, model));
+    visualize_yaw_prior(submap->id, yaw_world);
 
     logger->debug("yaw prior submap={} yaw_gnss={:.2f} yaw_est={:.2f} sigma={:.2f} [deg]", submap->id, yaw_world * 180.0 / M_PI, yaw_est * 180.0 / M_PI, sigma * 180.0 / M_PI);
+  }
+
+  /// @brief Status of a GNSS position prior, shown with the line color in the viewer
+  enum class GnssVisStatus {
+    NORMAL,     // prior created with the nominal information (cyan)
+    WEAK,       // weak GNSS ("Gnss faible"): prior created with the fallback information (orange)
+    ABANDONED,  // GNSS rejected ("Gnss abodonne"): no prior created (red)
+  };
+
+  struct GnssVisEntry {
+    bool has_position = false;
+    Eigen::Vector3f xyz = Eigen::Vector3f::Zero();  // GNSS position in the world frame
+    GnssVisStatus status = GnssVisStatus::NORMAL;
+
+    bool has_yaw = false;
+    float yaw = 0.0f;  // GNSS heading in the world frame [rad]
+  };
+
+  /// @brief Viewer side data. It is only accessed in the viewer thread (through invoke), and is owned by the queued tasks
+  ///        as well so that they do not depend on the lifetime of this module
+  struct GnssVisState {
+    std::map<int, GnssVisEntry> entries;            // submap id -> GNSS constraints
+    std::vector<Eigen::Vector3f> submap_positions;  // latest submap positions indexed by submap id (NaN if unknown)
+  };
+
+  void visualize_position_prior(const int submap_id, const Eigen::Vector3d& xyz, const GnssVisStatus status) {
+    if (!visualize_constraints || !guik::running()) {
+      return;
+    }
+
+    const auto state = vis_state;
+    const Eigen::Vector3f xyz_f = xyz.cast<float>();
+    guik::viewer()->invoke([state, submap_id, xyz_f, status] {
+      auto& entry = state->entries[submap_id];
+      // Keep showing the created prior if the same submap is rejected afterwards
+      if (status == GnssVisStatus::ABANDONED && entry.has_position && entry.status != GnssVisStatus::ABANDONED) {
+        return;
+      }
+      entry.has_position = true;
+      entry.xyz = xyz_f;
+      entry.status = status;
+      update_viewer(*state);
+    });
+  }
+
+  void visualize_yaw_prior(const int submap_id, const double yaw_world) {
+    if (!visualize_constraints || !guik::running()) {
+      return;
+    }
+
+    const auto state = vis_state;
+    guik::viewer()->invoke([state, submap_id, yaw_world] {
+      auto& entry = state->entries[submap_id];
+      entry.has_yaw = true;
+      entry.yaw = yaw_world;
+      update_viewer(*state);
+    });
+  }
+
+  /**
+   * @brief Draw the GNSS constraints (must be called in the viewer thread).
+   *        Position prior: line from the submap to the GNSS position + cross at the GNSS position (color = GnssVisStatus).
+   *        Yaw prior     : magenta line from the submap along the GNSS heading.
+   */
+  static void update_viewer(const GnssVisState& state) {
+    constexpr float marker_size = 0.3f;      // [m] half size of the cross at the GNSS position
+    constexpr float yaw_line_length = 3.0f;  // [m] length of the GNSS heading line
+    const Eigen::Vector4f yaw_color(1.0f, 0.0f, 1.0f, 1.0f);
+
+    std::vector<Eigen::Vector3f> vertices;
+    std::vector<Eigen::Vector4f> colors;
+    const auto add_line = [&](const Eigen::Vector3f& p0, const Eigen::Vector3f& p1, const Eigen::Vector4f& color) {
+      vertices.push_back(p0);
+      vertices.push_back(p1);
+      colors.push_back(color);
+      colors.push_back(color);
+    };
+
+    for (const auto& [submap_id, entry] : state.entries) {
+      Eigen::Vector4f color;
+      switch (entry.status) {
+        case GnssVisStatus::NORMAL:
+          color = Eigen::Vector4f(0.0f, 1.0f, 1.0f, 1.0f);
+          break;
+        case GnssVisStatus::WEAK:
+          color = Eigen::Vector4f(1.0f, 0.5f, 0.0f, 1.0f);
+          break;
+        case GnssVisStatus::ABANDONED:
+          color = Eigen::Vector4f(1.0f, 0.0f, 0.0f, 1.0f);
+          break;
+      }
+
+      // The cross stays visible even when the submap is on the GNSS position
+      if (entry.has_position) {
+        for (int k = 0; k < 3; k++) {
+          const Eigen::Vector3f d = Eigen::Vector3f::Unit(k) * marker_size;
+          add_line(entry.xyz - d, entry.xyz + d, color);
+        }
+      }
+
+      if (submap_id >= state.submap_positions.size() || !state.submap_positions[submap_id].allFinite()) {
+        continue;
+      }
+      const Eigen::Vector3f& pos = state.submap_positions[submap_id];
+
+      if (entry.has_position) {
+        add_line(pos, entry.xyz, color);
+      }
+      if (entry.has_yaw) {
+        add_line(pos, pos + yaw_line_length * Eigen::Vector3f(std::cos(entry.yaw), std::sin(entry.yaw), 0.0f), yaw_color);
+      }
+    }
+
+    if (vertices.empty()) {
+      return;
+    }
+
+    auto lines = std::make_shared<glk::ThinLines>(vertices, colors);
+    lines->set_line_width(2.0f);
+    guik::viewer()->update_drawable("gnss_constraints", lines, guik::VertexColor());
   }
 
   std::atomic_bool kill_switch;
@@ -452,7 +607,8 @@ private:
   double yaw_max_sigma;    // [rad] yaw priors with a larger sigma are not created
   int last_yaw_prior_submap_id;
 
-
+  bool visualize_constraints;               // draw the GNSS constraints in the viewer
+  std::shared_ptr<GnssVisState> vis_state;  // viewer side data (accessed only in the viewer thread)
 
   bool transformation_initialized;
   Eigen::Isometry3d T_world_utm;
