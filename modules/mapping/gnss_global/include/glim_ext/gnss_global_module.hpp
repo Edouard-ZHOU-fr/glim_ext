@@ -89,6 +89,7 @@ public:
     roll_pitch_prior_sigma = config.param<double>("gnss", "roll_pitch_prior_sigma_deg", 1.0) * M_PI / 180.0;
     roll_pitch_min_sigma = config.param<double>("gnss", "roll_pitch_min_sigma_deg", 0.5) * M_PI / 180.0;
     roll_pitch_max_sigma = config.param<double>("gnss", "roll_pitch_max_sigma_deg", 5.0) * M_PI / 180.0;
+    last_position_prior_submap_id = -1;
     last_rotation_prior_submap_id = -1;
     transformation_initialized = false;
     T_world_utm.setIdentity();
@@ -341,14 +342,18 @@ public:
         transformation_initialized = true;
       }
 
-      // Add translation prior factor
-      if (transformation_initialized) {
+      // Add translation prior factor (once per submap)
+      // submaps.back() is unchanged when the new submaps could not be associated with GNSS data yet (e.g., GNSS outage),
+      // which would add the same prior to the same submap again
+      if (transformation_initialized && submaps.back()->id != last_position_prior_submap_id) {
         const Eigen::Vector3d xyz = T_world_utm * submap_coords.back().segment<3>(1);
         // const Eigen::Vector3d xyz = submap_coords.back().segment<3>(1);
 
         logger->debug("submap={} gnss={}", convert_to_string(submaps.back()->T_world_origin.translation().eval()), convert_to_string(xyz));
 
         const auto& submap = submaps.back();
+        // Marked before the rejection check so that a rejected submap is not evaluated again
+        last_position_prior_submap_id = submap->id;
         GnssVisStatus vis_status = GnssVisStatus::NORMAL;
         // note: should use a more accurate information matrix
         if (dynamic_scale) {
@@ -754,6 +759,7 @@ private:
   double roll_pitch_min_sigma;    // [rad] lower bound of the sigma derived from the GNSS covariance
   double roll_pitch_max_sigma;    // [rad] roll/pitch priors with a larger sigma are not created
 
+  int last_position_prior_submap_id;
   int last_rotation_prior_submap_id;
 
   bool visualize_constraints;               // draw the GNSS constraints in the viewer
