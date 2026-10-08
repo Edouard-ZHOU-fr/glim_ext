@@ -67,9 +67,9 @@ class GNSSGlobal : public ExtensionModuleBase {
 public:
   EIGEN_MAKE_ALIGNED_OPERATOR_NEW
 
-  // [stamp, x, y, z, yaw, yaw_var, roll, pitch, roll_var, pitch_var] in the MGRS frame
-  // (roll, pitch, yaw: orientation of base_link [rad] (ZYX convention), *_var: their variances [rad^2])
-  using GnssData = Eigen::Matrix<double, 10, 1>;
+  // [stamp, x, y, z, yaw, yaw_var, roll, pitch, roll_var, pitch_var, x_var, y_var, z_var] in the MGRS frame
+  // (roll, pitch, yaw: orientation of base_link [rad] (ZYX convention), *_var: their variances [rad^2] / [m^2])
+  using GnssData = Eigen::Matrix<double, 13, 1>;
 
   GNSSGlobal() : logger(create_module_logger("gnss_global")) {
     logger->info("initializing GNSS global constraints");
@@ -128,19 +128,11 @@ public:
     double absolute_mgrs_y = gnss_msg->pose.pose.position.y;
     double absolute_alt = gnss_msg->pose.pose.position.z; // 
 //  recuperer la covariance de Kinematic_state
-    if (dynamic_scale) {
-      const double gnss_inscale_xy = 1.3;
-      const double gnss_inscale_z = 3.2;
-      double cov_x = gnss_msg->pose.covariance[0];
-      double cov_y = gnss_msg->pose.covariance[7];
-      double cov_z = gnss_msg->pose.covariance[14];
-      double info_x = (1.0 / std::max(cov_x, 1e-6))*gnss_inscale_xy; // eviter par 0
-      double info_y = (1.0 / std::max(cov_y, 1e-6))*gnss_inscale_xy;
-      double info_z = (1.0 / std::max(cov_z, 1e-6))*gnss_inscale_z;
-      // std::cout << "info_x:" << info_x << "; info_z:" << info_z << std::endl;
-      this->current_inf_scale << info_x, info_y, info_z;
-
-    }
+    // Stored with the position and interpolated at the submap time like the angle variances
+    // (the information of the position prior is computed from them when the prior is created)
+    double cov_x = gnss_msg->pose.covariance[0];
+    double cov_y = gnss_msg->pose.covariance[7];
+    double cov_z = gnss_msg->pose.covariance[14];
     // Orientation of base_link in the MGRS frame and its variances (covariance order: x, y, z, roll, pitch, yaw)
     const auto& o = gnss_msg->pose.pose.orientation;
     Eigen::Quaterniond q(o.w, o.x, o.y, o.z);
@@ -156,7 +148,7 @@ public:
       rpy = rpy_from_rotation(q.toRotationMatrix());
     }
 
-    gnss_data << to_sec(gnss_msg->header.stamp), absolute_mgrs_x, absolute_mgrs_y, absolute_alt, rpy[2], yaw_var, rpy[0], rpy[1], roll_var, pitch_var;
+    gnss_data << to_sec(gnss_msg->header.stamp), absolute_mgrs_x, absolute_mgrs_y, absolute_alt, rpy[2], yaw_var, rpy[0], rpy[1], roll_var, pitch_var, cov_x, cov_y, cov_z;
     input_gnss_queue.push_back(gnss_data);
     /////////////////////////////////////////////////////////////////////////
   }
@@ -255,8 +247,8 @@ public:
           const double diff = std::remainder((*right)[k] - (*left)[k], 2.0 * M_PI);
           interpolated[k] = std::remainder((*left)[k] + p * diff, 2.0 * M_PI);
         }
-        // An angle is unavailable if it is unavailable at either end (and 0 * inf would give NaN, i.e., "no covariance")
-        for (const int k : {5, 8, 9}) {
+        // A variance is infinite (e.g., an unavailable angle) if it is infinite at either end (and 0 * inf would give NaN, i.e., "no covariance")
+        for (const int k : {5, 8, 9, 10, 11, 12}) {
           if (std::isinf((*left)[k]) || std::isinf((*right)[k])) {
             interpolated[k] = std::numeric_limits<double>::infinity();
           }
@@ -357,20 +349,29 @@ public:
         GnssVisStatus vis_status = GnssVisStatus::NORMAL;
         // note: should use a more accurate information matrix
         if (dynamic_scale) {
-          logger->info("curent_scale={}", convert_to_string(current_inf_scale));
-          if (current_inf_scale.minCoeff() <= 1e3|| current_inf_scale.z() <= 2e3) {
-            if (current_inf_scale.minCoeff() <= 1e-2) {
+          // Information from the position variances at the submap time (same time as xyz)
+          const GnssData& gnss = submap_coords.back();
+          const double gnss_inscale_xy = 1.3;
+          const double gnss_inscale_z = 3.2;
+          double info_x = (1.0 / std::max(gnss[10], 1e-6))*gnss_inscale_xy; // eviter par 0
+          double info_y = (1.0 / std::max(gnss[11], 1e-6))*gnss_inscale_xy;
+          double info_z = (1.0 / std::max(gnss[12], 1e-6))*gnss_inscale_z;
+          Eigen::Vector3d inf_scale(info_x, info_y, info_z);
+
+          logger->info("curent_scale={}", convert_to_string(inf_scale));
+          if (inf_scale.minCoeff() <= 1e3|| inf_scale.z() <= 2e3) {
+            if (inf_scale.minCoeff() <= 1e-2) {
               logger->error("Gnss abodonne");
               visualize_position_prior(submap->id, xyz, GnssVisStatus::ABANDONED);
               continue;
             }
             else {
               logger->warn("Gnss faible");
-              current_inf_scale = Eigen::Vector3d(1e3, 1e3, 3e3);
+              inf_scale = Eigen::Vector3d(1e3, 1e3, 3e3);
               vis_status = GnssVisStatus::WEAK;
             }
           }
-          const auto model = gtsam::noiseModel::Isotropic::Information(current_inf_scale.asDiagonal());
+          const auto model = gtsam::noiseModel::Isotropic::Information(inf_scale.asDiagonal());
           gtsam::NonlinearFactor::shared_ptr factor(new gtsam::PoseTranslationPrior<gtsam::Pose3>(X(submap->id), xyz, model));
           output_factors.push_back(factor);
         }
@@ -745,7 +746,6 @@ private:
 
   std::string gnss_topic;
   Eigen::Vector3d prior_inf_scale;
-  Eigen::Vector3d current_inf_scale;
   bool dynamic_scale;
   double min_baseline;
 
