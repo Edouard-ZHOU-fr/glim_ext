@@ -263,23 +263,32 @@ public:
 //////////////////////synchoniser le time stamps <-- ///////////////////:
 
       // Initialize T_world_utm
-      if (!transformation_initialized && !submaps.empty() && (submaps.front()->T_world_origin.inverse() * submaps.back()->T_world_origin).translation().norm() > min_baseline) {
+      // Only the submaps with a usable GNSS position are used (see usable_for_alignment())
+      std::vector<int> align_indices;
+      if (!transformation_initialized) {
+        for (int i = 0; i < submaps.size(); i++) {
+          if (usable_for_alignment(submap_coords[i])) {
+            align_indices.push_back(i);
+          }
+        }
+      }
+      if (!transformation_initialized && !align_indices.empty() && (submaps[align_indices.front()]->T_world_origin.inverse() * submaps[align_indices.back()]->T_world_origin).translation().norm() > min_baseline) {
         Eigen::Vector3d mean_est = Eigen::Vector3d::Zero();
         Eigen::Vector3d mean_gnss = Eigen::Vector3d::Zero();
-        for (int i = 0; i < submaps.size(); i++) {
+        for (const int i : align_indices) {
           mean_est += submaps[i]->T_world_origin.translation();
           mean_gnss += submap_coords[i].segment<3>(1);
         }
-        mean_est /= submaps.size();
-        mean_gnss /= submaps.size();
+        mean_est /= align_indices.size();
+        mean_gnss /= align_indices.size();
 
         Eigen::Matrix3d cov = Eigen::Matrix3d::Zero();
-        for (int i = 0; i < submaps.size(); i++) {
+        for (const int i : align_indices) {
           const Eigen::Vector3d centered_est = submaps[i]->T_world_origin.translation() - mean_est;
           const Eigen::Vector3d centered_gnss = submap_coords[i].segment<3>(1) - mean_gnss;  // 累加所有插值后的 GNSS 点
           cov += centered_gnss * centered_est.transpose();
         }
-        cov /= submaps.size();
+        cov /= align_indices.size();
 
         const Eigen::JacobiSVD<Eigen::Matrix2d> svd(cov.block<2, 2>(0, 0), Eigen::ComputeFullU | Eigen::ComputeFullV);
         const Eigen::Matrix2d U = svd.matrixU();
@@ -328,10 +337,14 @@ public:
         }
 
         // logger->info("T_world_mgrs={}", convert_to_string(T_world_utm));
-        logger->info("T_mgrs_world={}", convert_to_string(T_utm_world));
+        logger->info("T_mgrs_world={} (estimated from {} / {} submaps)", convert_to_string(T_utm_world), align_indices.size(), submaps.size());
         mgrsLogToFile("Mgrs.txt",convert_to_string(T_utm_world));
 
         transformation_initialized = true;
+      }
+      // No GNSS prior is created until the initialization: tell why it is pending if GNSS positions are skipped
+      if (!transformation_initialized && align_indices.size() < submaps.size()) {
+        logger->warn("T_mgrs_world not initialized yet: only {} / {} submaps have a usable GNSS position", align_indices.size(), submaps.size());
       }
 
       // Add translation prior factor (once per submap)
@@ -581,6 +594,30 @@ private:
 
   double yaw_sigma(const double var) const { return rotation_prior_sigma(var, yaw_prior_sigma, yaw_min_sigma, yaw_max_sigma); }
   double roll_pitch_sigma(const double var) const { return rotation_prior_sigma(var, roll_pitch_prior_sigma, roll_pitch_min_sigma, roll_pitch_max_sigma); }
+
+  /**
+   * @brief Check if the GNSS position at a submap time can be used to estimate T_world_utm.
+   * @note  T_world_utm is estimated only once: a biased position (e.g., before the EKF converges) would offset all the following
+   *        position priors against the first submap fixed by the global mapping. With dynamic_scale, only the positions that get a
+   *        nominal position prior (neither "Gnss faible" nor "Gnss abodonne") are used: same information and thresholds as the
+   *        position prior in backend_task(), to be kept consistent with it.
+   */
+  bool usable_for_alignment(const GnssData& gnss) const {
+    if (!gnss.segment<3>(1).allFinite()) {
+      return false;
+    }
+    if (!dynamic_scale) {
+      return true;
+    }
+
+    const double gnss_inscale_xy = 1.3;
+    const double gnss_inscale_z = 3.2;
+    double info_x = (1.0 / std::max(gnss[10], 1e-6))*gnss_inscale_xy; // eviter par 0
+    double info_y = (1.0 / std::max(gnss[11], 1e-6))*gnss_inscale_xy;
+    double info_z = (1.0 / std::max(gnss[12], 1e-6))*gnss_inscale_z;
+    // Negation of the "Gnss faible" condition (min(info) <= 1e3 || info_z <= 2e3). False for NaN
+    return info_x > 1e3 && info_y > 1e3 && info_z > 2e3;
+  }
 
   /// @brief Roll, pitch and yaw [rad] such that R = Rz(yaw) * Ry(pitch) * Rx(roll) (ZYX convention, as ROS)
   static Eigen::Vector3d rpy_from_rotation(const Eigen::Matrix3d& R) {
