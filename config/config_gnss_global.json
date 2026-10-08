@@ -3,9 +3,14 @@
   // yaw_prior_sigma_deg : Sigma of the yaw prior [deg] (used when dynamic_scale is false, or when the message has no valid yaw covariance)
   // yaw_min_sigma_deg   : Lower bound of the sigma derived from the message yaw covariance [deg] (dynamic_scale = true)
   // yaw_max_sigma_deg   : Yaw priors with a larger sigma are not created [deg]
+  // enable_roll_pitch_prior    : If true, constrain the roll/pitch of submaps with the roll/pitch (orientation) of the GNSS pose messages
+  // roll_pitch_prior_sigma_deg : Sigma of the roll/pitch prior [deg] (used when dynamic_scale is false, or when the message has no valid roll/pitch covariance)
+  // roll_pitch_min_sigma_deg   : Lower bound of the sigma derived from the message roll/pitch covariance [deg] (dynamic_scale = true)
+  // roll_pitch_max_sigma_deg   : Roll/pitch priors with a larger sigma are not created [deg]
   // isShow              : If true, draw the GNSS constraints in the viewer
   //                       position prior: submap -> GNSS position line + cross (cyan: normal, orange: weak, red: abandoned)
   //                       yaw prior     : magenta line from the submap along the GNSS heading
+  //                       roll/pitch prior: yellow line from the submap along the up direction (z axis) of the prior
   "gnss": {
     "gnss_topic": "/localization/pose_with_covariance_stamped",
     "min_baseline": 3.0,
@@ -18,7 +23,11 @@
     "enable_yaw_prior": true,
     "yaw_prior_sigma_deg": 1.0,
     "yaw_min_sigma_deg": 0.5,
-    "yaw_max_sigma_deg": 5.0,
+    "yaw_max_sigma_deg": 3.0,
+    "enable_roll_pitch_prior": true,
+    "roll_pitch_prior_sigma_deg": 1.0,
+    "roll_pitch_min_sigma_deg": 0.5,
+    "roll_pitch_max_sigma_deg": 5.0,
     "isShow": true
   }
 }
