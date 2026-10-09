@@ -79,6 +79,7 @@ public:
     glim::Config config(config_path);
     gnss_topic = config.param<std::string>("gnss", "gnss_topic", "/pose_with_cov");
     prior_inf_scale = config.param<Eigen::Vector3d>("gnss", "prior_inf_scale", Eigen::Vector3d(1e3, 1e3, 3e3));
+    weak_inf_scale = config.param<Eigen::Vector3d>("gnss", "weak_inf_scale", Eigen::Vector3d(1e3, 1e3, 3e3));
     min_baseline = config.param<double>("gnss", "min_baseline", 5.0);
     dynamic_scale =  config.param<bool>("gnss", "dynamic_scale", false);
     enable_yaw_prior = config.param<bool>("gnss", "enable_yaw_prior", false);
@@ -372,7 +373,7 @@ public:
           Eigen::Vector3d inf_scale(info_x, info_y, info_z);
 
           logger->info("curent_scale={}", convert_to_string(inf_scale));
-          if (inf_scale.minCoeff() <= 1e3|| inf_scale.z() <= 2e3) {
+          if (inf_scale.minCoeff() <= 5e2|| inf_scale.z() <= 1e3) {
             if (inf_scale.minCoeff() <= 1e-2) {
               logger->error("Gnss abodonne");
               visualize_position_prior(submap->id, xyz, GnssVisStatus::ABANDONED);
@@ -380,7 +381,7 @@ public:
             }
             else {
               logger->warn("Gnss faible");
-              inf_scale = Eigen::Vector3d(1e3, 1e3, 3e3);
+              inf_scale = weak_inf_scale;
               vis_status = GnssVisStatus::WEAK;
             }
           }
@@ -783,6 +784,7 @@ private:
 
   std::string gnss_topic;
   Eigen::Vector3d prior_inf_scale;
+  Eigen::Vector3d weak_inf_scale;  // information of the translation prior for a weak GNSS ("Gnss faible", dynamic_scale = true)
   bool dynamic_scale;
   double min_baseline;
 
