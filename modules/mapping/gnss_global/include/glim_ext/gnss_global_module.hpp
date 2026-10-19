@@ -150,6 +150,13 @@ public:
     }
 
     gnss_data << to_sec(gnss_msg->header.stamp), absolute_mgrs_x, absolute_mgrs_y, absolute_alt, rpy[2], yaw_var, rpy[0], rpy[1], roll_var, pitch_var, cov_x, cov_y, cov_z;
+    // A variance that is not given (NaN or <= 0, e.g., an unfilled covariance) is stored as NaN so that it stays "not given" after the
+    // interpolation at the submap time (an interpolation with a given variance would give a small positive one). +inf is kept
+    for (const int k : {5, 8, 9, 10, 11, 12}) {
+      if (!(gnss_data[k] > 0.0)) {
+        gnss_data[k] = std::numeric_limits<double>::quiet_NaN();
+      }
+    }
     input_gnss_queue.push_back(gnss_data);
     /////////////////////////////////////////////////////////////////////////
   }
@@ -365,12 +372,12 @@ public:
         if (dynamic_scale) {
           // Information from the position variances at the submap time (same time as xyz)
           const GnssData& gnss = submap_coords.back();
-          const double gnss_inscale_xy = 1.3;
-          const double gnss_inscale_z = 3.2;
-          double info_x = (1.0 / std::max(gnss[10], 1e-6))*gnss_inscale_xy; // eviter par 0
-          double info_y = (1.0 / std::max(gnss[11], 1e-6))*gnss_inscale_xy;
-          double info_z = (1.0 / std::max(gnss[12], 1e-6))*gnss_inscale_z;
-          Eigen::Vector3d inf_scale(info_x, info_y, info_z);
+          Eigen::Vector3d inf_scale;
+          if (!position_information(gnss, inf_scale)) {
+            logger->error("Gnss abodonne: Zero covariance: (var={})", convert_to_string(gnss.segment<3>(10).eval()));
+            visualize_position_prior(submap->id, xyz, GnssVisStatus::ABANDONED);
+            continue;
+          }
 
           logger->info("curent_scale={}", convert_to_string(inf_scale));
           if (inf_scale.minCoeff() <= 5e2|| inf_scale.z() <= 1e3) {
@@ -597,11 +604,30 @@ private:
   double roll_pitch_sigma(const double var) const { return rotation_prior_sigma(var, roll_pitch_prior_sigma, roll_pitch_min_sigma, roll_pitch_max_sigma); }
 
   /**
+   * @brief Information of the translation prior from the GNSS position variances at the submap time (dynamic_scale = true).
+   * @param inf_scale  [out] information [x, y, z]. A variance of +inf (unavailable) gives 0
+   * @return           false if a variance is not given (NaN, see gnss_callback()): the position must not be used. A zero
+   *                   covariance (e.g., unfilled before the EKF initialization) would otherwise give the strongest prior
+   */
+  bool position_information(const GnssData& gnss, Eigen::Vector3d& inf_scale) const {
+    const Eigen::Array3d var = gnss.segment<3>(10);
+    // False for NaN
+    if (!(var > 0.0).all()) {
+      return false;
+    }
+
+    const double gnss_inscale_xy = 1.3;
+    const double gnss_inscale_z = 3.2;
+    // The floor bounds the information of an overconfident covariance (sigma >= 1 mm)
+    inf_scale = Eigen::Array3d(gnss_inscale_xy, gnss_inscale_xy, gnss_inscale_z) / var.max(1e-6);
+    return true;
+  }
+
+  /**
    * @brief Check if the GNSS position at a submap time can be used to estimate T_world_utm.
    * @note  T_world_utm is estimated only once: a biased position (e.g., before the EKF converges) would offset all the following
-   *        position priors against the first submap fixed by the global mapping. With dynamic_scale, only the positions that get a
-   *        nominal position prior (neither "Gnss faible" nor "Gnss abodonne") are used: same information and thresholds as the
-   *        position prior in backend_task(), to be kept consistent with it.
+   *        position priors against the first submap fixed by the global mapping. With dynamic_scale, only the positions with a
+   *        reliable covariance are used: same information as the position prior in backend_task() (position_information()).
    */
   bool usable_for_alignment(const GnssData& gnss) const {
     if (!gnss.segment<3>(1).allFinite()) {
@@ -611,13 +637,12 @@ private:
       return true;
     }
 
-    const double gnss_inscale_xy = 1.3;
-    const double gnss_inscale_z = 3.2;
-    double info_x = (1.0 / std::max(gnss[10], 1e-6))*gnss_inscale_xy; // eviter par 0
-    double info_y = (1.0 / std::max(gnss[11], 1e-6))*gnss_inscale_xy;
-    double info_z = (1.0 / std::max(gnss[12], 1e-6))*gnss_inscale_z;
-    // Negation of the "Gnss faible" condition (min(info) <= 1e3 || info_z <= 2e3). False for NaN
-    return info_x > 1e3 && info_y > 1e3 && info_z > 2e3;
+    Eigen::Vector3d inf_scale;
+    if (!position_information(gnss, inf_scale)) {
+      return false;
+    }
+    // Stricter than the "Gnss faible" condition of the position prior (min(info) <= 5e2 || info_z <= 1e3)
+    return inf_scale.x() > 1e3 && inf_scale.y() > 1e3 && inf_scale.z() > 2e3;
   }
 
   /// @brief Roll, pitch and yaw [rad] such that R = Rz(yaw) * Ry(pitch) * Rx(roll) (ZYX convention, as ROS)
