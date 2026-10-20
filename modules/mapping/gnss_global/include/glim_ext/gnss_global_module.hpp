@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <atomic>
 #include <memory>
+#include <mutex>
 #include <thread>
 #include <numeric>
 #include <cmath>
@@ -106,9 +107,8 @@ public:
     using std::placeholders::_3;
     GlobalMappingCallbacks::on_insert_submap.add(std::bind(&GNSSGlobal::on_insert_submap, this, _1));
     GlobalMappingCallbacks::on_smoother_update.add(std::bind(&GNSSGlobal::on_smoother_update, this, _1, _2, _3));
-    if (visualize_constraints) {
-      GlobalMappingCallbacks::on_update_submaps.add(std::bind(&GNSSGlobal::on_update_submaps, this, _1));
-    }
+    // Always registered: it keeps the latest submap poses for the GNSS thread (see submap_poses)
+    GlobalMappingCallbacks::on_update_submaps.add(std::bind(&GNSSGlobal::on_update_submaps, this, _1));
   }
   ~GNSSGlobal() {
     kill_switch = true;
@@ -176,7 +176,24 @@ public:
   }
     /////////////////////////////////////////////////////////////////////////
 
-  void on_insert_submap(const SubMap::ConstPtr& submap) { input_submap_queue.push_back(submap); }
+  // Called in the global mapping thread before submap->frames are replaced (SubMap::drop_frame_points()): the GNSS thread only uses
+  // the data copied here
+  void on_insert_submap(const SubMap::ConstPtr& submap) {
+    {
+      std::lock_guard<std::mutex> lock(submap_poses_mutex);
+      set_submap_pose(submap->id, submap->T_world_origin);
+    }
+
+    const auto origin = submap->origin_frame();
+    SubmapInfo info;
+    info.id = submap->id;
+    info.stamp_front = submap->frames.front()->stamp;
+    info.stamp_origin = origin->stamp;
+    info.stamp_back = submap->frames.back()->stamp;
+    // T_world_origin is the sensor pose of the origin frame: identity if the sensor is the IMU. Independent of the world frame
+    info.T_origin_imu = origin->T_world_sensor().inverse() * origin->T_world_imu;
+    input_submap_queue.push_back(info);
+  }
 
   void on_smoother_update(gtsam_points::ISAM2Ext& isam2, gtsam::NonlinearFactorGraph& new_factors, gtsam::Values& new_values) {
     const auto factors = output_factors.get_all_and_clear();
@@ -186,8 +203,17 @@ public:
     }
   }
 
+  // Called in the global mapping thread after the optimization
   void on_update_submaps(const std::vector<SubMap::Ptr>& submaps) {
-    if (!guik::running()) {
+    {
+      // Updated at once so that the GNSS thread gets poses consistent with each other (all from the same optimization)
+      std::lock_guard<std::mutex> lock(submap_poses_mutex);
+      for (const auto& submap : submaps) {
+        set_submap_pose(submap->id, submap->T_world_origin);
+      }
+    }
+
+    if (!visualize_constraints || !guik::running()) {
       return;
     }
 
@@ -210,7 +236,7 @@ public:
   void backend_task() {
     logger->info("starting GNSS global thread");
     std::deque<GnssData> utm_queue;
-    std::deque<SubMap::ConstPtr> submap_queue;
+    std::deque<SubmapInfo> submap_queue;
 
 /////////////////synchoniser le time stamps -->///////////////////:
 
@@ -228,15 +254,15 @@ public:
       submap_queue.insert(submap_queue.end(), new_submaps.begin(), new_submaps.end());
 
       // Remove submaps that are created earlier than the oldest GNSS data
-      while (!utm_queue.empty() && !submap_queue.empty() && submap_queue.front()->frames.front()->stamp < utm_queue.front()[0]) {
+      while (!utm_queue.empty() && !submap_queue.empty() && submap_queue.front().stamp_front <= utm_queue.front()[0]) {
         submap_queue.pop_front();
       }
 
       // Interpolate UTM coords and associate with submaps
-      while (!utm_queue.empty() && !submap_queue.empty() && submap_queue.front()->frames.front()->stamp > utm_queue.front()[0] &&
-             submap_queue.front()->frames.back()->stamp < utm_queue.back()[0]) {
+      while (!utm_queue.empty() && !submap_queue.empty() && submap_queue.front().stamp_front > utm_queue.front()[0] &&
+             submap_queue.front().stamp_back < utm_queue.back()[0]) {
         const auto& submap = submap_queue.front();
-        const double stamp = submap->frames[submap->frames.size() / 2]->stamp;
+        const double stamp = submap.stamp_origin;
 
         const auto right = std::lower_bound(utm_queue.begin(), utm_queue.end(), stamp, [](const GnssData& utm, const double t) { return utm[0] < t; });
         if (right == utm_queue.end() || (right + 1) == utm_queue.end()) {
@@ -272,19 +298,23 @@ public:
 
       // Initialize T_world_utm
       // Only the submaps with a usable GNSS position are used (see usable_for_alignment())
+      // The positions and the headings are taken from the same copy of the latest submap poses (world frame of the global mapping)
       std::vector<int> align_indices;
+      std::vector<Eigen::Isometry3d> T_world_submaps;
       if (!transformation_initialized) {
+        T_world_submaps = latest_submap_poses();
         for (int i = 0; i < submaps.size(); i++) {
           if (usable_for_alignment(submap_coords[i])) {
             align_indices.push_back(i);
           }
         }
       }
-      if (!transformation_initialized && !align_indices.empty() && (submaps[align_indices.front()]->T_world_origin.inverse() * submaps[align_indices.back()]->T_world_origin).translation().norm() > min_baseline) {
+      const auto T_world_submap = [&](const int i) -> const Eigen::Isometry3d& { return T_world_submaps[submaps[i].id]; };
+      if (!transformation_initialized && !align_indices.empty() && (T_world_submap(align_indices.front()).inverse() * T_world_submap(align_indices.back())).translation().norm() > min_baseline) {
         Eigen::Vector3d mean_est = Eigen::Vector3d::Zero();
         Eigen::Vector3d mean_gnss = Eigen::Vector3d::Zero();
         for (const int i : align_indices) {
-          mean_est += submaps[i]->T_world_origin.translation();
+          mean_est += T_world_submap(i).translation();
           mean_gnss += submap_coords[i].segment<3>(1);
         }
         mean_est /= align_indices.size();
@@ -292,7 +322,7 @@ public:
 
         Eigen::Matrix3d cov = Eigen::Matrix3d::Zero();
         for (const int i : align_indices) {
-          const Eigen::Vector3d centered_est = submaps[i]->T_world_origin.translation() - mean_est;
+          const Eigen::Vector3d centered_est = T_world_submap(i).translation() - mean_est;
           const Eigen::Vector3d centered_gnss = submap_coords[i].segment<3>(1) - mean_gnss;  // 累加所有插值后的 GNSS 点
           cov += centered_gnss * centered_est.transpose();
         }
@@ -318,7 +348,7 @@ public:
         const double svd_yaw = std::atan2(T_utm_world.linear()(1, 0), T_utm_world.linear()(0, 0));
         double heading_yaw = 0.0;
         double heading_spread = 0.0;
-        if (enable_yaw_prior && estimate_yaw_offset_from_heading(heading_yaw, heading_spread)) {
+        if (enable_yaw_prior && estimate_yaw_offset_from_heading(T_world_submaps, heading_yaw, heading_spread)) {
           T_utm_world.linear() = Eigen::AngleAxisd(heading_yaw, Eigen::Vector3d::UnitZ()).toRotationMatrix();
           logger->info(
             "T_mgrs_world yaw from GNSS heading={:.3f} deg (spread={:.3f} deg), from positions (SVD)={:.3f} deg",
@@ -331,7 +361,7 @@ public:
 
         // Both world frames are gravity-aligned: T_mgrs_world has no roll/pitch, only check the consistency
         if (enable_roll_pitch_prior) {
-          log_roll_pitch_offset();
+          log_roll_pitch_offset(T_world_submaps);
         }
 
         // Given the rotation, the least-squares translation aligns the centroids
@@ -341,7 +371,7 @@ public:
 
         for (int i = 0; i < submaps.size(); i++) {
           const Eigen::Vector3d gnss = T_world_utm * submap_coords[i].segment<3>(1);
-          logger->debug("submap={} gnss={}", convert_to_string(submaps[i]->T_world_origin.translation().eval()), convert_to_string(gnss));
+          logger->debug("submap={} gnss={}", convert_to_string(T_world_submap(i).translation().eval()), convert_to_string(gnss));
         }
 
         // logger->info("T_world_mgrs={}", convert_to_string(T_world_utm));
@@ -358,15 +388,15 @@ public:
       // Add translation prior factor (once per submap)
       // submaps.back() is unchanged when the new submaps could not be associated with GNSS data yet (e.g., GNSS outage),
       // which would add the same prior to the same submap again
-      if (transformation_initialized && submaps.back()->id != last_position_prior_submap_id) {
+      if (transformation_initialized && submaps.back().id != last_position_prior_submap_id) {
         const Eigen::Vector3d xyz = T_world_utm * submap_coords.back().segment<3>(1);
         // const Eigen::Vector3d xyz = submap_coords.back().segment<3>(1);
 
-        logger->debug("submap={} gnss={}", convert_to_string(submaps.back()->T_world_origin.translation().eval()), convert_to_string(xyz));
-
         const auto& submap = submaps.back();
+        logger->debug("submap={} gnss={}", convert_to_string(latest_submap_pose(submap.id).translation().eval()), convert_to_string(xyz));
+
         // Marked before the rejection check so that a rejected submap is not evaluated again
-        last_position_prior_submap_id = submap->id;
+        last_position_prior_submap_id = submap.id;
         GnssVisStatus vis_status = GnssVisStatus::NORMAL;
         // note: should use a more accurate information matrix
         if (dynamic_scale) {
@@ -375,7 +405,7 @@ public:
           Eigen::Vector3d inf_scale;
           if (!position_information(gnss, inf_scale)) {
             logger->error("Gnss abodonne: Zero covariance: (var={})", convert_to_string(gnss.segment<3>(10).eval()));
-            visualize_position_prior(submap->id, xyz, GnssVisStatus::ABANDONED);
+            visualize_position_prior(submap.id, xyz, GnssVisStatus::ABANDONED);
             continue;
           }
 
@@ -383,7 +413,7 @@ public:
           if (inf_scale.minCoeff() <= 5e2|| inf_scale.z() <= 1e3) {
             if (inf_scale.minCoeff() <= 1e-2) {
               logger->error("Gnss abodonne");
-              visualize_position_prior(submap->id, xyz, GnssVisStatus::ABANDONED);
+              visualize_position_prior(submap.id, xyz, GnssVisStatus::ABANDONED);
               continue;
             }
             else {
@@ -393,34 +423,65 @@ public:
             }
           }
           const auto model = gtsam::noiseModel::Isotropic::Information(inf_scale.asDiagonal());
-          gtsam::NonlinearFactor::shared_ptr factor(new gtsam::PoseTranslationPrior<gtsam::Pose3>(X(submap->id), xyz, model));
+          gtsam::NonlinearFactor::shared_ptr factor(new gtsam::PoseTranslationPrior<gtsam::Pose3>(X(submap.id), xyz, model));
           output_factors.push_back(factor);
         }
         else {
           const auto model = gtsam::noiseModel::Isotropic::Information(prior_inf_scale.asDiagonal());
-          gtsam::NonlinearFactor::shared_ptr factor(new gtsam::PoseTranslationPrior<gtsam::Pose3>(X(submap->id), xyz, model));
+          gtsam::NonlinearFactor::shared_ptr factor(new gtsam::PoseTranslationPrior<gtsam::Pose3>(X(submap.id), xyz, model));
           output_factors.push_back(factor);
         }
         // Show the GNSS position prior in the viewer (the viewer does not draw unary factors)
-        visualize_position_prior(submap->id, xyz, vis_status);
+        visualize_position_prior(submap.id, xyz, vis_status);
 
         // Add rotation (yaw and/or roll/pitch) prior factor (once per submap)
-        if ((enable_yaw_prior || enable_roll_pitch_prior) && submap->id != last_rotation_prior_submap_id) {
+        if ((enable_yaw_prior || enable_roll_pitch_prior) && submap.id != last_rotation_prior_submap_id) {
           add_rotation_prior(submap, submap_coords.back());
-          last_rotation_prior_submap_id = submap->id;
+          last_rotation_prior_submap_id = submap.id;
         }
       }
     }
   }
 
 private:
+  /// @brief Submap data used by the GNSS thread, copied in the global mapping thread (on_insert_submap()). The GNSS thread must not
+  ///        access the submaps: the global mapping thread updates submap->T_world_origin and replaces submap->frames
+  struct SubmapInfo {
+    int id;
+    double stamp_front;              // stamp of the first frame
+    double stamp_origin;             // stamp of the origin frame (frames[frames.size() / 2])
+    double stamp_back;               // stamp of the last frame
+    Eigen::Isometry3d T_origin_imu;  // IMU pose in the submap origin frame
+  };
+
+  /// @brief Store the latest pose of a submap (submap_poses_mutex must be locked)
+  void set_submap_pose(const int id, const Eigen::Isometry3d& T_world_origin) {
+    if (id >= submap_poses.size()) {
+      submap_poses.resize(id + 1, Eigen::Isometry3d::Identity());
+    }
+    submap_poses[id] = T_world_origin;
+  }
+
+  /// @brief Copy of the latest submap poses in the world frame of the global mapping indexed by submap id (consistent with each other)
+  std::vector<Eigen::Isometry3d> latest_submap_poses() const {
+    std::lock_guard<std::mutex> lock(submap_poses_mutex);
+    return submap_poses;
+  }
+
+  /// @brief Latest pose of a submap in the world frame of the global mapping
+  Eigen::Isometry3d latest_submap_pose(const int id) const {
+    std::lock_guard<std::mutex> lock(submap_poses_mutex);
+    return submap_poses[id];
+  }
+
   /**
    * @brief Estimate the yaw of T_utm_world as the circular mean of (GNSS heading - estimated heading) over the associated submaps.
-   * @param yaw     [out] yaw of T_utm_world [rad]
-   * @param spread  [out] circular standard deviation of the differences [rad] (consistency check)
-   * @return        false if no submap has a usable GNSS heading
+   * @param T_world_submaps  latest submap poses indexed by submap id (same poses as the positions used for the translation)
+   * @param yaw              [out] yaw of T_utm_world [rad]
+   * @param spread           [out] circular standard deviation of the differences [rad] (consistency check)
+   * @return                 false if no submap has a usable GNSS heading
    */
-  bool estimate_yaw_offset_from_heading(double& yaw, double& spread) const {
+  bool estimate_yaw_offset_from_heading(const std::vector<Eigen::Isometry3d>& T_world_submaps, double& yaw, double& spread) const {
     double sum_sin = 0.0;
     double sum_cos = 0.0;
     int num_used = 0;
@@ -431,8 +492,8 @@ private:
         continue;
       }
 
-      // The odometry pose of the origin frame is used (submap->T_world_origin is concurrently updated by the global mapping)
-      const Eigen::Matrix3d R_world_est = submaps[i]->origin_frame()->T_world_imu.linear();
+      // IMU pose in the world frame of the global mapping (the odometry world frame would differ by the drift corrected so far)
+      const Eigen::Matrix3d R_world_est = (T_world_submaps[submaps[i].id] * submaps[i].T_origin_imu).linear();
       const double yaw_est = std::atan2(R_world_est(1, 0), R_world_est(0, 0));
       const double diff = gnss[4] - yaw_est;
       sum_sin += std::sin(diff);
@@ -455,8 +516,9 @@ private:
    * @brief Log the differences between the GNSS and estimated roll/pitch over the associated submaps (consistency check).
    * @note  No roll/pitch alignment is estimated because both world frames are gravity-aligned. A non-zero mean indicates a
    *        rotation between the IMU frame and base_link, or a gravity misalignment of the GLIM world frame.
+   * @param T_world_submaps  latest submap poses indexed by submap id
    */
-  void log_roll_pitch_offset() const {
+  void log_roll_pitch_offset(const std::vector<Eigen::Isometry3d>& T_world_submaps) const {
     Eigen::Vector2d sum = Eigen::Vector2d::Zero();
     Eigen::Vector2d sum_sq = Eigen::Vector2d::Zero();
     int num_used = 0;
@@ -467,8 +529,7 @@ private:
         continue;
       }
 
-      // The odometry pose of the origin frame is used (submap->T_world_origin is concurrently updated by the global mapping)
-      const Eigen::Vector3d rpy_est = rpy_from_rotation(submaps[i]->origin_frame()->T_world_imu.linear());
+      const Eigen::Vector3d rpy_est = rpy_from_rotation((T_world_submaps[submaps[i].id] * submaps[i].T_origin_imu).linear());
       const Eigen::Vector2d diff(std::remainder(gnss[6] - rpy_est[0], 2.0 * M_PI), gnss[7] - rpy_est[1]);
       sum += diff;
       sum_sq += diff.cwiseAbs2();
@@ -502,7 +563,7 @@ private:
    *        estimated yaw and the optimized one does not bias a roll/pitch-only prior. The translation gets a negligible weight.
    *        The submap origin is assumed to be the base_link frame (IMU frame = base_link).
    */
-  void add_rotation_prior(const SubMap::ConstPtr& submap, const GnssData& gnss) {
+  void add_rotation_prior(const SubmapInfo& submap, const GnssData& gnss) {
     // Sigma of each angle [roll, pitch, yaw] (+inf: not constrained)
     const double inf = std::numeric_limits<double>::infinity();
     const Eigen::Vector3d sigmas(
@@ -510,7 +571,7 @@ private:
       enable_roll_pitch_prior ? roll_pitch_sigma(gnss[9]) : inf,
       enable_yaw_prior ? yaw_sigma(gnss[5]) : inf);
     if (sigmas.array().isInf().all()) {
-      logger->debug("skip rotation prior for submap {} (no usable GNSS angle)", submap->id);
+      logger->debug("skip rotation prior for submap {} (no usable GNSS angle)", submap.id);
       return;
     }
 
@@ -520,10 +581,9 @@ private:
     const double yaw_world_utm = std::atan2(R_world_utm(1, 0), R_world_utm(0, 0));
     const Eigen::Vector3d rpy_gnss(gnss[6], gnss[7], std::remainder(gnss[4] + yaw_world_utm, 2.0 * M_PI));
 
-    // The odometry pose of the origin frame is used instead of submap->T_world_origin, which is concurrently updated by the global
-    // mapping thread. Both world frames are gravity-aligned. Only the rotation part matters. The translation of the estimate keeps
-    // the (negligible) translation error small
-    const Eigen::Isometry3d& T_world_est = submap->origin_frame()->T_world_imu;
+    // Latest IMU pose estimate in the world frame of the global mapping (same frame as X(submap.id) and T_world_utm). Only the
+    // rotation part matters. The translation of the estimate keeps the (negligible) translation error small
+    const Eigen::Isometry3d T_world_est = latest_submap_pose(submap.id) * submap.T_origin_imu;
     const Eigen::Vector3d rpy_est = rpy_from_rotation(T_world_est.linear());
 
     constexpr double loose = 1e3;
@@ -556,13 +616,13 @@ private:
     information.topLeftCorner<3, 3>() = sqrt_info.transpose() * sqrt_info;
     information.bottomRightCorner<3, 3>() = gtsam::Matrix3::Identity() / (loose * loose);
     const auto model = gtsam::noiseModel::Gaussian::Information(information);
-    output_factors.push_back(gtsam::make_shared<gtsam::PriorFactor<gtsam::Pose3>>(X(submap->id), prior, model));
+    output_factors.push_back(gtsam::make_shared<gtsam::PriorFactor<gtsam::Pose3>>(X(submap.id), prior, model));
 
     if (std::isfinite(sigmas[2])) {
-      visualize_yaw_prior(submap->id, rpy_prior[2]);
+      visualize_yaw_prior(submap.id, rpy_prior[2]);
     }
     if (std::isfinite(sigmas[0]) || std::isfinite(sigmas[1])) {
-      visualize_roll_pitch_prior(submap->id, R_prior.col(2));
+      visualize_roll_pitch_prior(submap.id, R_prior.col(2));
     }
 
     const Eigen::Vector3d gnss_deg = rpy_gnss * 180.0 / M_PI;
@@ -570,7 +630,7 @@ private:
     const Eigen::Vector3d sigmas_deg = sigmas * 180.0 / M_PI;
     logger->debug(
       "rotation prior submap={} gnss/est/sigma roll={:.2f}/{:.2f}/{:.2f} pitch={:.2f}/{:.2f}/{:.2f} yaw={:.2f}/{:.2f}/{:.2f} [deg] (sigma=inf: not constrained)",
-      submap->id,
+      submap.id,
       gnss_deg[0],
       est_deg[0],
       sigmas_deg[0],
@@ -801,11 +861,16 @@ private:
   std::thread thread;
 
   ConcurrentVector<GnssData> input_gnss_queue;
-  ConcurrentVector<SubMap::ConstPtr> input_submap_queue;
+  ConcurrentVector<SubmapInfo> input_submap_queue;
   ConcurrentVector<gtsam::NonlinearFactor::shared_ptr> output_factors;
 
-  std::vector<SubMap::ConstPtr> submaps;
+  std::vector<SubmapInfo> submaps;
   std::vector<GnssData> submap_coords;
+
+  // Latest submap->T_world_origin indexed by submap id. Written in the global mapping thread (on_insert_submap(), on_update_submaps()),
+  // read in the GNSS thread
+  mutable std::mutex submap_poses_mutex;
+  std::vector<Eigen::Isometry3d> submap_poses;
 
   std::string gnss_topic;
   Eigen::Vector3d prior_inf_scale;
